@@ -62,8 +62,8 @@ use crate::{
     update_state::UpdateState,
 };
 
-pub const MICROSOFT: &str = "microsoft";
-pub const WINGET_PKGS: &str = "winget-pkgs";
+pub const MICROSOFT: &str = "pl4nty";
+pub const WINGET_PKGS: &str = "winget-pkgs-selfhost";
 pub const WINGET_PKGS_FULL_NAME: &str = formatcp!("{MICROSOFT}/{WINGET_PKGS}");
 pub const GITHUB_HOST: &str = "github.com";
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
