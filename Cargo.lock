@@ -2500,8 +2500,6 @@ checksum = "f4c7245a08504955605670dbf141fceab975f15ca21570696aebe9d2e71576bd"
 [[package]]
 name = "inno"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60226624939e7476d16464d3c45528102b6c1f48ecd252625c0f8f16a70bf668"
 dependencies = [
  "bitflags",
  "codepage",

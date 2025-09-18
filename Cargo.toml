@@ -110,3 +110,6 @@ rstest = "0.26.1"
 assets = [
     { source = "target/release/komac", dest = "/usr/bin/komac", mode = "755" },
 ]
+
+[patch.crates-io]
+inno = { path = "vendor/inno/core" }
