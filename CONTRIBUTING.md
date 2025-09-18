@@ -17,11 +17,11 @@ Contributions are what make the open source community such an amazing place to l
 
 ### Testing your changes
 
-Using Docker is the easiest way to to test your code before submitting a pull request. 
+Using Docker is the easiest way to to test your code before submitting a pull request.
 
 > [!NOTE]
 > When using the Docker container on Windows, the WSL engine does not support the default collection for keys or tokens. This means that when testing inside the container GitHub tokens will not be stored, even when `komac token update` is used.
-> 
+>
 > This is a [known issue](https://github.com/hwchen/keyring-rs/blob/47c8daf3e6178a2282ae3e8670d1ea7fa736b8cb/src/secret_service.rs#L73-L77) which is documented in the keyring crate.
 >
 > As a workaround, you can set the `GITHUB_TOKEN` environment variable from within the container, in the `docker run` command, or in the Dockerfile itself
@@ -31,3 +31,30 @@ Using Docker is the easiest way to to test your code before submitting a pull re
 3. Wait for the build to complete.
 4. Start the container using `docker run -it komac_dev bash`.
 5. Test out any commands. Use the `exit` command to quit the container
+
+### Known Bugs
+
+#### Burn
+
+| Error | Examples | Comment |
+|---------|---------------------|---------|
+| `Expected RParen, got Some(Ident("or"))` | python-3.12.9-amd64.exe | Can't parse InstallCondition with implied evaluation eg A or B or C |
+
+#### Inno
+
+The error message is typically `failed to fill whole buffer` with no further details.
+
+| Version | Examples | Comment |
+|---------|---------------------|---------|
+| 5570 | BHPIO CAD Build v9.1 for Microstation Connect 060522.exe |  |
+| 5500u | ClassicStickyNotes-2.0-setup.exe |  |
+| 3061 | e-bility5.00.64g.exe |  |
+| 4260 | MoffFreeCalcSetup.exe |  |
+| 5570 | Ultranalysis Suite 3 Base Setup.exe | |
+
+#### NSIS
+
+| Error | Examples | Comment |
+|---------|---------------------|---------|
+| `The conversion failed because the source bytes are not a valid value of the destination type. Destination type: [komac::installers::nsis::entry::Entry]` | iTwinStudioSetup.exe |  |
+| Leading unicode in `DefaultInstallLocation` | mbbServiceSetup.exe<br>scopephoto.exe | Failing to parse app root? |

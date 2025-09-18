@@ -1,0 +1,3 @@
+[submodule "vendor/inno"]
+	path = vendor/inno
+	url = https://github.com/russellbanks/inno
