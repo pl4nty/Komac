@@ -2,7 +2,7 @@ use std::io::{Read, Seek};
 
 use color_eyre::Result;
 use inno::{Inno, error::InnoError};
-use winget_types::installer::{Architecture, Installer, InstallerType};
+use winget_types::installer::{Architecture, Installer, InstallerSwitches, InstallerType};
 use yara_x::mods::PE;
 
 use super::{super::Installers, Burn, Nsis};
@@ -12,8 +12,9 @@ use crate::{
 };
 
 const ORIGINAL_FILENAME: &str = "OriginalFilename";
+const INTERNAL_NAME: &str = "InternalName";
 const FILE_DESCRIPTION: &str = "FileDescription";
-const BASIC_INSTALLER_KEYWORDS: [&str; 4] = ["installer", "setup", "7zs.sfx", "7zsd.sfx"];
+const BASIC_INSTALLER_KEYWORDS: [&str; 2] = ["installer", "setup"];
 
 pub enum Exe {
     Burn(Box<Burn>),
@@ -42,9 +43,34 @@ impl Exe {
             Err(error) => return Err(error.into()),
         }
 
-        Ok(Self::Generic(Box::new(Installer {
-            architecture: Architecture::from_machine(pe.machine()),
-            r#type: if pe
+        let internal_name = pe
+            .version_info_list
+            .iter()
+            .find(|key_value| key_value.key() == INTERNAL_NAME)
+            .and_then(|key_value| key_value.value.as_deref())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+
+        let switches = match internal_name.as_str() {
+            "sfxcab.exe" => InstallerSwitches::builder()
+                .silent("/quiet".parse().unwrap())
+                .build(),
+            "7zs.sfx" | "7z.sfx" | "7zsd.sfx" => InstallerSwitches::builder()
+                .silent("/s".parse().unwrap())
+                .build(),
+            "setup launcher" => InstallerSwitches::builder()
+                .silent("/s".parse().unwrap())
+                .build(),
+            "wextract" => InstallerSwitches::builder()
+                .silent("/Q".parse().unwrap())
+                .build(),
+            _ => InstallerSwitches::default(),
+        };
+
+        let installer_type = if switches.silent().is_some() {
+            InstallerType::Exe
+        } else {
+            let is_installer = pe
                 .version_info_list
                 .iter()
                 .filter(|key_value| matches!(key_value.key(), FILE_DESCRIPTION | ORIGINAL_FILENAME))
@@ -53,11 +79,19 @@ impl Exe {
                     BASIC_INSTALLER_KEYWORDS
                         .iter()
                         .any(|keyword| value.contains(keyword))
-                }) {
-                Some(InstallerType::Exe)
+                });
+
+            if is_installer {
+                InstallerType::Exe
             } else {
-                Some(InstallerType::Portable)
-            },
+                InstallerType::Portable
+            }
+        };
+
+        Ok(Self::Generic(Box::new(Installer {
+            architecture: Architecture::from_machine(pe.machine()),
+            r#type: Some(installer_type),
+            switches,
             ..Installer::default()
         })))
     }
