@@ -5,6 +5,7 @@ use inno::{
     header::{Architecture as InnoArchitecture, PrivilegesRequiredOverrides},
 };
 use msi::Language as CodePageLanguage;
+use regex::Regex;
 use winget_types::{
     LanguageTag, Sha256String,
     installer::{
@@ -72,6 +73,24 @@ impl Installers for Inno {
                 default_install_location: install_dir.map(Utf8PathBuf::from),
                 ..InstallationMetadata::default()
             },
+            switches: InstallerSwitches::builder()
+                .maybe_custom({
+                    let param_regex = Regex::new(r"\{param:([^|]+)\(|([^}]+)\)?}").unwrap();
+                    let header_str = format!("{:?}", self.header);
+                    let mut switches = param_regex
+                        .captures_iter(&header_str)
+                        .filter_map(|caps| {
+                            Some(format!(
+                                "/{}=\"{}\"",
+                                caps.get(1)?.as_str(),
+                                caps.get(2)?.as_str()
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    switches.sort();
+                    switches.join(" ").parse().ok()
+                })
+                .build(),
             ..Default::default()
         };
 

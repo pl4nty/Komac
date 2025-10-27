@@ -13,7 +13,7 @@ use winget_types::{
     LanguageTag,
     installer::{
         AppsAndFeaturesEntries, AppsAndFeaturesEntry, Architecture, InstallationMetadata,
-        Installer, InstallerType, Scope,
+        Installer, InstallerSwitches, InstallerType, Scope,
     },
 };
 
@@ -273,6 +273,24 @@ impl Installers for Msi {
                 default_install_location: self.find_install_directory(),
                 ..InstallationMetadata::default()
             },
+            switches: InstallerSwitches::builder()
+                .maybe_custom({
+                    let mut switches = self
+                        .property_table
+                        .iter()
+                        // Public properties are uppercase
+                        // https://learn.microsoft.com/en-us/windows/win32/msi/property-reference
+                        // TODO Indicate standard vs custom properties?
+                        .filter(|(key, _)| {
+                            key.chars()
+                                .all(|char| char.is_uppercase() || !char.is_alphabetic())
+                        })
+                        .map(|(key, value)| format!("{}=\"{}\"", key, value))
+                        .collect::<Vec<_>>();
+                    switches.sort();
+                    switches.join(" ").parse().ok()
+                })
+                .build(),
             ..Installer::default()
         };
 
