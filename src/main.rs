@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, crate_name};
 use color_eyre::eyre::Result;
 use tracing::{Level, metadata::LevelFilter};
 use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, filter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::commands::{
     analyse::Analyse,
@@ -75,9 +75,10 @@ fn setup_logging() {
         )
         .with(indicatif_layer)
         .with(
-            filter::Targets::new()
-                .with_default(LevelFilter::INFO)
-                .with_target(crate_name!(), Level::TRACE),
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy()
+                .add_directive(format!("{}=trace", crate_name!()).parse().unwrap()),
         )
         .init();
 }
