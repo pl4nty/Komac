@@ -53,6 +53,20 @@ struct IsFileAttributesX {
     is_unicode_launcher: u16,
 }
 
+// Newer format used in InstallShield 30.x+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct IsFileAttributesX30 {
+    filename_len: u32,  // 0x00: length of filename in bytes
+    x2: u32,            // 0x04: unknown (count/flag?)
+    encoded_flags: u32, // 0x08: file flags
+    file_len: u32,      // 0x0C: file length
+    x3: [u8; 8],        // 0x10: padding/unknown
+    timestamp1: u64,    // 0x18: first timestamp
+    timestamp2: u64,    // 0x20: second timestamp
+    timestamp3: u64,    // 0x28: third timestamp
+} // Total: 48 bytes (0x30)
+
 pub struct InstallShield {
     pub file_count: u16,
     pub file_names: Vec<String>,
@@ -63,6 +77,7 @@ pub struct InstallShield {
     pub product_name: Option<String>,
     pub product_version: Option<String>,
     pub product_code: Option<String>,
+    pub upgrade_code: Option<String>,
     pub msi: Option<Msi>,
     pub installshield_version: Option<String>,
 }
@@ -71,6 +86,7 @@ impl InstallShield {
     pub fn new<R: Read + Seek>(reader: &mut R, pe: &PE) -> Result<Self, InstallShieldError> {
         // Get data offset (after last PE section)
         let mut data_offset = Self::get_data_offset(reader, pe)?;
+        debug!("Data section starts at: {:#X}", data_offset);
 
         // Try to skip version signature like "NB10" that may appear before InstallShield header
         reader.seek(SeekFrom::Start(data_offset))?;
@@ -84,7 +100,7 @@ impl InstallShield {
                 // The C code uses fscanf with patterns to skip, we'll look for the signature
                 reader.seek(SeekFrom::Start(data_offset))?;
                 let mut search_buf = vec![0u8; 512];
-                if let Ok(n) = reader.read(&mut search_buf) {
+                if let Ok(_n) = reader.read(&mut search_buf) {
                     // Look for "InstallShield" or "ISSetupStream" in the buffer
                     if let Some(pos) = search_buf
                         .windows(13)
@@ -110,48 +126,225 @@ impl InstallShield {
         let _type_field = header.type_field;
         let is_stream = &header.sig[..13] == ISSIG_STRM;
 
-        // We'll detect version later after parsing MSI (if available)
+        // Detect version early to know which structure to use
+        let is_version_30_plus = pe
+            .version_info
+            .get("ISInternalVersion")
+            .and_then(|v| v.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok())
+            .map(|major| major >= 30)
+            .unwrap_or(false);
 
-        debug!("Found InstallShield installer with {} files", num_files);
+        debug!(
+            "Found InstallShield installer with {} files (IS 30+: {})",
+            num_files, is_version_30_plus
+        );
+
+        // For IS 30.x+, the file table is located after a second ISSetupStream signature
+        // Search for it if this is IS 30.x
+        let file_table_offset = if is_version_30_plus && is_stream {
+            // Search for second ISSetupStream signature
+            let current_pos = reader.stream_position()?;
+            let mut found_offset = None;
+            let file_size = reader.seek(SeekFrom::End(0))?;
+            reader.seek(SeekFrom::Start(current_pos))?;
+
+            // Search from current position onwards
+            let mut search_offset = current_pos;
+            let chunk_size = 1024 * 1024; // 1 MB chunks
+
+            while search_offset < file_size {
+                reader.seek(SeekFrom::Start(search_offset))?;
+                let mut search_buf = vec![0u8; chunk_size];
+                let n = reader.read(&mut search_buf)?;
+
+                if let Some(pos) = search_buf[..n].windows(13).position(|w| w == ISSIG_STRM) {
+                    found_offset = Some(search_offset + pos as u64);
+                    break;
+                }
+
+                search_offset += (n - 13) as u64; // Overlap to catch signatures at boundaries
+                if n < chunk_size {
+                    break;
+                }
+            }
+
+            found_offset.unwrap_or(data_offset + std::mem::size_of::<IsHeader>() as u64)
+        } else {
+            data_offset + std::mem::size_of::<IsHeader>() as u64
+        };
+
+        debug!("File table starts at offset: 0x{:X}", file_table_offset);
 
         // Parse file names and extract file data
         let mut file_names = Vec::new();
         let mut file_data_map: Vec<(String, u64, u32, u32)> = Vec::new(); // (name, offset, size, flags)
-        let mut current_offset = data_offset + std::mem::size_of::<IsHeader>() as u64;
+        let mut current_offset = file_table_offset;
+
+        // If we found a second header, skip it
+        if is_version_30_plus
+            && is_stream
+            && file_table_offset != data_offset + std::mem::size_of::<IsHeader>() as u64
+        {
+            current_offset += std::mem::size_of::<IsHeader>() as u64;
+        }
 
         for _i in 0..num_files {
             reader.seek(SeekFrom::Start(current_offset))?;
 
             if is_stream {
-                // ISSetupStream format uses IS_FILE_ATTRIBUTES_X
-                match Self::read_file_attributes_x(reader) {
-                    Ok(attrs) => {
-                        // Read UTF-16 filename
-                        let mut filename_bytes = vec![0u8; attrs.filename_len as usize];
-                        reader.read_exact(&mut filename_bytes)?;
+                // ISSetupStream format - structure differs between IS 12.x and IS 30.x+
+                if is_version_30_plus {
+                    // Use IS 30.x structure
+                    match Self::read_file_attributes_x30(reader) {
+                        Ok(attrs) => {
+                            let filename_len = attrs.filename_len;
+                            let file_len = attrs.file_len;
+                            let encoded_flags = attrs.encoded_flags;
 
-                        // Convert UTF-16 to String
-                        let u16_chars: Vec<u16> = filename_bytes
-                            .chunks_exact(2)
-                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                            .collect();
+                            debug!(
+                                "File {}: filename_len={}, file_len={}, flags=0x{:X}",
+                                _i, filename_len, file_len, encoded_flags
+                            );
 
-                        if let Ok(filename) = String::from_utf16(&u16_chars) {
-                            let filename = filename.trim_end_matches('\0').to_string();
-                            let data_offset_for_file = reader.stream_position()?;
-                            file_data_map.push((
-                                filename.clone(),
-                                data_offset_for_file,
-                                attrs.file_len,
-                                attrs.encoded_flags,
-                            ));
-                            file_names.push(filename);
+                            // Read UTF-16 filename
+                            let mut filename_bytes = vec![0u8; filename_len as usize];
+                            reader.read_exact(&mut filename_bytes)?;
+
+                            // Convert UTF-16 to String
+                            let u16_chars: Vec<u16> = filename_bytes
+                                .chunks_exact(2)
+                                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                                .collect();
+
+                            if let Ok(filename) = String::from_utf16(&u16_chars) {
+                                let filename = filename.trim_end_matches('\0').to_string();
+                                debug!("  Filename: {}", filename);
+                                let data_offset_for_file = reader.stream_position()?;
+                                file_data_map.push((
+                                    filename.clone(),
+                                    data_offset_for_file,
+                                    file_len,
+                                    encoded_flags,
+                                ));
+                                file_names.push(filename);
+                            }
+
+                            // For IS 30.x, file data is inline but file_len is unreliable
+                            // Scan forward to find the next file attributes structure
+                            current_offset = reader.stream_position()?;
+
+                            // Try to find next attributes by looking for reasonable filename_len
+                            let scan_start = current_offset;
+                            let scan_limit = 150_000_000; // Max 150MB to scan (files stored inline, no offset table)
+                            let mut found_next = false;
+
+                            // Scan with 1-byte steps (file attributes can be at any byte offset)
+                            for offset in 0..scan_limit {
+                                if reader.seek(SeekFrom::Start(scan_start + offset)).is_ok() {
+                                    let mut test_bytes = [0u8; 12];
+                                    if reader.read_exact(&mut test_bytes).is_ok() {
+                                        let test_len = u32::from_le_bytes([
+                                            test_bytes[0],
+                                            test_bytes[1],
+                                            test_bytes[2],
+                                            test_bytes[3],
+                                        ]);
+                                        let test_x2 = u32::from_le_bytes([
+                                            test_bytes[4],
+                                            test_bytes[5],
+                                            test_bytes[6],
+                                            test_bytes[7],
+                                        ]);
+                                        let test_flags = u32::from_le_bytes([
+                                            test_bytes[8],
+                                            test_bytes[9],
+                                            test_bytes[10],
+                                            test_bytes[11],
+                                        ]);
+
+                                        // Check if this looks like valid attributes:
+                                        // - filename_len between 10 and 200 (reasonable for UTF-16 filenames)
+                                        // - x2 is typically 6 for IS 30.x (prefer 6, require >= 1)
+                                        // - flags should have upper byte set (not 0x00 or 0xFF which indicate garbage)
+                                        if test_len >= 10 && test_len <= 200 && test_len % 2 == 0 &&  // UTF-16 filenames are even length
+                                           test_x2 >= 1 && test_x2 <= 10 &&  // Require x2 >= 1 to avoid false positives
+                                           (test_flags & 0xFF000000) != 0 && (test_flags & 0xFF000000) != 0xFF000000 &&
+                                           (test_x2 == 6 || offset > 10000)
+                                        // Strongly prefer x2=6; only accept others after 10KB
+                                        {
+                                            current_offset = scan_start + offset;
+                                            found_next = true;
+                                            if _i < 5 || offset > 1_000_000 {
+                                                debug!(
+                                                    "  Found next file at offset +{}KB",
+                                                    offset / 1024
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !found_next && _i + 1 < num_files {
+                                debug!(
+                                    "Could not find next file attributes for IS 30.x file {} within {}MB scan limit, stopping parse at offset {:#X}",
+                                    _i + 1,
+                                    scan_limit / (1024 * 1024),
+                                    current_offset
+                                );
+                                break;
+                            }
                         }
-
-                        current_offset = reader.stream_position()?;
-                        current_offset += attrs.file_len as u64;
+                        Err(e) => {
+                            debug!("Failed to read file attributes at index {}: {}", _i, e);
+                            break;
+                        }
                     }
-                    Err(_) => break,
+                } else {
+                    // Use IS 12.x structure
+                    match Self::read_file_attributes_x(reader) {
+                        Ok(attrs) => {
+                            let filename_len = attrs.filename_len;
+                            let file_len = attrs.file_len;
+                            let encoded_flags = attrs.encoded_flags;
+
+                            debug!(
+                                "File {}: filename_len={}, file_len={}, flags=0x{:X}",
+                                _i, filename_len, file_len, encoded_flags
+                            );
+
+                            // Read UTF-16 filename
+                            let mut filename_bytes = vec![0u8; filename_len as usize];
+                            reader.read_exact(&mut filename_bytes)?;
+
+                            // Convert UTF-16 to String
+                            let u16_chars: Vec<u16> = filename_bytes
+                                .chunks_exact(2)
+                                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                                .collect();
+
+                            if let Ok(filename) = String::from_utf16(&u16_chars) {
+                                let filename = filename.trim_end_matches('\0').to_string();
+                                let data_offset_for_file = reader.stream_position()?;
+                                file_data_map.push((
+                                    filename.clone(),
+                                    data_offset_for_file,
+                                    file_len,
+                                    encoded_flags,
+                                ));
+                                file_names.push(filename);
+                            }
+
+                            current_offset = reader.stream_position()?;
+                            current_offset += file_len as u64;
+                        }
+                        Err(e) => {
+                            debug!("Failed to read file attributes at index {}: {}", _i, e);
+                            break;
+                        }
+                    }
                 }
             } else {
                 // Standard format uses IS_FILE_ATTRIBUTES
@@ -209,18 +402,43 @@ impl InstallShield {
             }
         }
 
-        // Try to extract and parse language INI file
-        if let Some(lang_ini_name) = file_names
-            .iter()
-            .find(|name| name.ends_with(".ini") && name.starts_with("0x"))
-        {
+        // Parse Setup.ini for metadata first to get the default language
+        let (
+            product_name,
+            product_version,
+            product_code,
+            upgrade_code,
+            setup_ini_language,
+            msi_package_name,
+        ) = if let Some(ref ini) = setup_ini_content {
+            Self::parse_setup_ini_metadata(ini)
+        } else {
+            (None, None, None, None, None, None)
+        };
+
+        // Determine primary language - prefer Setup.ini Default language
+        let temp_primary_language = setup_ini_language.or_else(|| {
+            file_names.iter().find_map(|name| {
+                if name.ends_with(".ini") && name.starts_with("0x") {
+                    let hex_str = name.strip_prefix("0x")?.strip_suffix(".ini")?;
+                    u16::from_str_radix(hex_str, 16).ok()
+                } else {
+                    None
+                }
+            })
+        });
+
+        // Try to extract and parse language INI file matching the primary language
+        if let Some(lang_id) = temp_primary_language {
+            let target_lang_file = format!("0x{:04x}.ini", lang_id);
+
             if let Some((filename, offset, size, flags)) = file_data_map
                 .iter()
-                .find(|(name, _, _, _)| name == lang_ini_name)
+                .find(|(name, _, _, _)| name.eq_ignore_ascii_case(&target_lang_file))
             {
                 debug!(
-                    "Found language file {} at offset 0x{:X}, size {}",
-                    filename, offset, size
+                    "Found language file {} (primary language 0x{:04X}) at offset 0x{:X}, size {}",
+                    filename, lang_id, offset, size
                 );
 
                 if let Ok(Some(content)) = Self::extract_and_decrypt_file(
@@ -228,16 +446,35 @@ impl InstallShield {
                 ) {
                     debug!("Language INI ({}) contents:\n{}", filename, content);
                 }
+            } else {
+                debug!(
+                    "Primary language file {} not found, trying first available",
+                    target_lang_file
+                );
+
+                // Fallback to first language file if primary not found
+                if let Some(lang_ini_name) = file_names
+                    .iter()
+                    .find(|name| name.ends_with(".ini") && name.starts_with("0x"))
+                {
+                    if let Some((filename, offset, size, flags)) = file_data_map
+                        .iter()
+                        .find(|(name, _, _, _)| name == lang_ini_name)
+                    {
+                        debug!(
+                            "Found fallback language file {} at offset 0x{:X}, size {}",
+                            filename, offset, size
+                        );
+
+                        if let Ok(Some(content)) = Self::extract_and_decrypt_file(
+                            reader, filename, *offset, *size, *flags, is_stream,
+                        ) {
+                            debug!("Language INI ({}) contents:\n{}", filename, content);
+                        }
+                    }
+                }
             }
         }
-
-        // Parse Setup.ini for metadata
-        let (product_name, product_version, product_code, setup_ini_language, msi_package_name) =
-            if let Some(ref ini) = setup_ini_content {
-                Self::parse_setup_ini_metadata(ini)
-            } else {
-                (None, None, None, None, None)
-            };
 
         // Try to extract and analyze the MSI if referenced in Setup.ini
         let msi = if let Some(ref package_name) = msi_package_name {
@@ -319,17 +556,8 @@ impl InstallShield {
             None
         };
 
-        // Extract primary language - prefer Setup.ini Default language over language files
-        let primary_language = setup_ini_language.or_else(|| {
-            file_names.iter().find_map(|name| {
-                if name.ends_with(".ini") && name.starts_with("0x") {
-                    let hex_str = name.strip_prefix("0x")?.strip_suffix(".ini")?;
-                    u16::from_str_radix(hex_str, 16).ok()
-                } else {
-                    None
-                }
-            })
-        });
+        // Primary language was already determined above
+        let primary_language = temp_primary_language;
 
         if let Some(lang_id) = primary_language {
             debug!("Detected primary language: 0x{:04X}", lang_id);
@@ -341,11 +569,13 @@ impl InstallShield {
 
         let architecture = Architecture::from_machine(pe.machine());
 
-        // Detect InstallShield version from MSI if available, otherwise from header
-        let installshield_version = msi
-            .as_ref()
-            .and_then(|m| m.creating_application.as_deref())
-            .and_then(|app| Self::parse_installshield_version(app))
+        // Detect InstallShield version - prioritize PE version info, then MSI, then header
+        let installshield_version = Self::detect_version_from_pe(pe)
+            .or_else(|| {
+                msi.as_ref()
+                    .and_then(|m| m.creating_application.as_deref())
+                    .and_then(|app| Self::parse_installshield_version(app))
+            })
             .or_else(|| Self::detect_version(&header));
 
         if let Some(ref version) = installshield_version {
@@ -362,6 +592,7 @@ impl InstallShield {
             product_name,
             product_version,
             product_code,
+            upgrade_code,
             msi,
             installshield_version,
         })
@@ -394,6 +625,14 @@ impl InstallShield {
             return Some(creating_app.to_string());
         }
 
+        None
+    }
+
+    fn detect_version_from_pe(pe: &PE) -> Option<String> {
+        // Check for ISInternalVersion in PE version info
+        if let Some(is_version) = pe.version_info.get("ISInternalVersion") {
+            return Some(is_version.to_string());
+        }
         None
     }
 
@@ -436,7 +675,10 @@ impl InstallShield {
         }
     }
 
-    fn get_data_offset<R: Read + Seek>(reader: &mut R, pe: &PE) -> Result<u64, InstallShieldError> {
+    fn get_data_offset<R: Read + Seek>(
+        _reader: &mut R,
+        pe: &PE,
+    ) -> Result<u64, InstallShieldError> {
         // Find the last section and calculate offset after it
         if let Some(last_section) = pe.sections.last() {
             let offset =
@@ -518,32 +760,103 @@ impl InstallShield {
     fn read_file_attributes_x<R: Read>(
         reader: &mut R,
     ) -> Result<IsFileAttributesX, InstallShieldError> {
-        let mut attrs = IsFileAttributesX {
-            filename_len: 0,
-            encoded_flags: 0,
-            x3: [0; 2],
-            file_len: 0,
-            x5: [0; 8],
-            is_unicode_launcher: 0,
+        let mut all_bytes = [0u8; 24];
+        reader.read_exact(&mut all_bytes)?;
+
+        let attrs = IsFileAttributesX {
+            filename_len: u32::from_le_bytes([
+                all_bytes[0],
+                all_bytes[1],
+                all_bytes[2],
+                all_bytes[3],
+            ]),
+            encoded_flags: u32::from_le_bytes([
+                all_bytes[4],
+                all_bytes[5],
+                all_bytes[6],
+                all_bytes[7],
+            ]),
+            x3: [all_bytes[8], all_bytes[9]],
+            file_len: u32::from_le_bytes([
+                all_bytes[10],
+                all_bytes[11],
+                all_bytes[12],
+                all_bytes[13],
+            ]),
+            x5: [
+                all_bytes[14],
+                all_bytes[15],
+                all_bytes[16],
+                all_bytes[17],
+                all_bytes[18],
+                all_bytes[19],
+                all_bytes[20],
+                all_bytes[21],
+            ],
+            is_unicode_launcher: u16::from_le_bytes([all_bytes[22], all_bytes[23]]),
         };
 
-        let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf)?;
-        attrs.filename_len = u32::from_le_bytes(buf);
+        Ok(attrs)
+    }
 
-        reader.read_exact(&mut buf)?;
-        attrs.encoded_flags = u32::from_le_bytes(buf);
+    fn read_file_attributes_x30<R: Read>(
+        reader: &mut R,
+    ) -> Result<IsFileAttributesX30, InstallShieldError> {
+        let mut all_bytes = [0u8; 48];
+        reader.read_exact(&mut all_bytes)?;
 
-        reader.read_exact(&mut attrs.x3)?;
-
-        reader.read_exact(&mut buf)?;
-        attrs.file_len = u32::from_le_bytes(buf);
-
-        reader.read_exact(&mut attrs.x5)?;
-
-        let mut buf = [0u8; 2];
-        reader.read_exact(&mut buf)?;
-        attrs.is_unicode_launcher = u16::from_le_bytes(buf);
+        let attrs = IsFileAttributesX30 {
+            filename_len: u32::from_le_bytes([
+                all_bytes[0],
+                all_bytes[1],
+                all_bytes[2],
+                all_bytes[3],
+            ]),
+            x2: u32::from_le_bytes([all_bytes[4], all_bytes[5], all_bytes[6], all_bytes[7]]),
+            encoded_flags: u32::from_le_bytes([
+                all_bytes[8],
+                all_bytes[9],
+                all_bytes[10],
+                all_bytes[11],
+            ]),
+            file_len: u32::from_le_bytes([
+                all_bytes[12],
+                all_bytes[13],
+                all_bytes[14],
+                all_bytes[15],
+            ]),
+            x3: all_bytes[16..24].try_into().unwrap(),
+            timestamp1: u64::from_le_bytes([
+                all_bytes[24],
+                all_bytes[25],
+                all_bytes[26],
+                all_bytes[27],
+                all_bytes[28],
+                all_bytes[29],
+                all_bytes[30],
+                all_bytes[31],
+            ]),
+            timestamp2: u64::from_le_bytes([
+                all_bytes[32],
+                all_bytes[33],
+                all_bytes[34],
+                all_bytes[35],
+                all_bytes[36],
+                all_bytes[37],
+                all_bytes[38],
+                all_bytes[39],
+            ]),
+            timestamp3: u64::from_le_bytes([
+                all_bytes[40],
+                all_bytes[41],
+                all_bytes[42],
+                all_bytes[43],
+                all_bytes[44],
+                all_bytes[45],
+                all_bytes[46],
+                all_bytes[47],
+            ]),
+        };
 
         Ok(attrs)
     }
@@ -564,11 +877,17 @@ impl InstallShield {
         offset: u64,
         size: u32,
         flags: u32,
-        is_stream: bool,
+        _is_stream: bool,
     ) -> Result<Option<String>, InstallShieldError> {
         reader.seek(SeekFrom::Start(offset))?;
-        let mut file_data = vec![0u8; size as usize];
-        reader.read_exact(&mut file_data)?;
+
+        // For IS 30.x, size may be 0 or unreliable. Read up to a reasonable limit.
+        let actual_size = if size == 0 { 100_000 } else { size as usize };
+        let mut file_data = vec![0u8; actual_size];
+
+        // Try to read the data - may read less than requested if we hit EOF
+        let bytes_read = reader.read(&mut file_data)?;
+        file_data.truncate(bytes_read);
 
         debug!(
             "{} raw first bytes: {:02X?}",
@@ -577,11 +896,21 @@ impl InstallShield {
         );
 
         // Check if file needs decryption based on flags
-        let needs_decryption = (flags & 0x6) != 0;
+        // For IS 30.x, flags are in the upper byte (0xXX000000)
+        // For IS 12.x and older, flags are in lower byte
+        let flag_byte = if (flags & 0xFF000000) != 0 {
+            // IS 30.x - use upper byte
+            (flags >> 24) & 0xFF
+        } else {
+            // IS 12.x - use lower byte
+            flags & 0xFF
+        };
+
+        let needs_decryption = (flag_byte & 0x6) != 0;
         if needs_decryption {
             debug!(
-                "{} is encrypted (flags: 0x{:X}), attempting to decrypt",
-                filename, flags
+                "{} is encrypted (flags: 0x{:X}, flag_byte: 0x{:02X}), attempting to decrypt",
+                filename, flags, flag_byte
             );
 
             // Generate decryption key from filename
@@ -589,8 +918,8 @@ impl InstallShield {
             let key = Self::gen_key(seed);
 
             // Determine decoding method based on flags
-            let has_type_4 = (flags & 0x4) != 0;
-            let has_type_2 = (flags & 0x2) != 0;
+            let has_type_4 = (flag_byte & 0x4) != 0;
+            let has_type_2 = (flag_byte & 0x2) != 0;
 
             debug!(
                 "Decryption flags - has_type_4: {}, has_type_2: {}, key_len: {}",
@@ -734,12 +1063,14 @@ impl InstallShield {
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
         Option<u16>,
         Option<String>,
     ) {
         let mut product_name = None;
         let mut product_version = None;
         let mut product_code = None;
+        let mut upgrade_code = None;
         let mut default_language = None;
         let mut package_name = None;
 
@@ -752,6 +1083,8 @@ impl InstallShield {
                 product_version = Some(value.trim().to_string());
             } else if let Some(value) = line.strip_prefix("ProductCode=") {
                 product_code = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("UpgradeCode=") {
+                upgrade_code = Some(value.trim().to_string());
             } else if let Some(value) = line.strip_prefix("Default=") {
                 // Parse hex language code like "0x0409"
                 if let Some(hex_str) = value.trim().strip_prefix("0x") {
@@ -766,6 +1099,7 @@ impl InstallShield {
             product_name,
             product_version,
             product_code,
+            upgrade_code,
             default_language,
             package_name,
         )
@@ -825,6 +1159,7 @@ impl Installers for InstallShield {
                     .maybe_display_name(self.product_name.as_deref())
                     .maybe_display_version(self.product_version.as_deref())
                     .maybe_product_code(self.product_code.as_deref())
+                    .maybe_upgrade_code(self.upgrade_code.as_deref())
                     .build()
                     .into()
             } else {

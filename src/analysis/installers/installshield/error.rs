@@ -4,7 +4,6 @@ use std::fmt;
 pub enum InstallShieldError {
     NotInstallShieldFile,
     InvalidHeader,
-    InvalidFileAttributes,
     IoError(std::io::Error),
     Utf8Error(std::string::FromUtf8Error),
 }
@@ -14,7 +13,6 @@ impl fmt::Display for InstallShieldError {
         match self {
             Self::NotInstallShieldFile => write!(f, "Not an InstallShield file"),
             Self::InvalidHeader => write!(f, "Invalid InstallShield header"),
-            Self::InvalidFileAttributes => write!(f, "Invalid file attributes"),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::Utf8Error(e) => write!(f, "UTF-8 error: {}", e),
         }
